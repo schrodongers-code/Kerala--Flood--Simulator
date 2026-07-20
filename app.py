@@ -3,11 +3,14 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, r2_score
 import data_loader
 
 # 1. Page Configuration
 st.set_page_config(
-    page_title="Kerala Flood Warning & Simulator",
+    page_title="Kerala Flood Warning & ML Simulator",
     page_icon="🌊",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -36,9 +39,53 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# 2. Sidebar Controls (Simulation Inputs)
-st.sidebar.header("🌊 Simulator Parameters")
-st.sidebar.write("Adjust the environmental conditions below to predict the flood risk:")
+# 2. Machine Learning Model Training (Cached for performance)
+@st.cache_resource
+def train_ml_model():
+    # A. Generate/load 10 years of simulated monsoon records
+    df = data_loader.generate_historical_monsoon_dataset(size=1200)
+    
+    # B. Define features (X) and target variable (y)
+    feature_cols = [
+        "antecedent_rain", 
+        "forecast_rain", 
+        "reservoir_storage", 
+        "release_strategy", 
+        "tide_level"
+    ]
+    X = df[feature_cols]
+    y = df["flood_risk_pct"]
+    
+    # C. Split into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # D. Train Random Forest Regressor
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train)
+    
+    # E. Evaluate model
+    y_pred = model.predict(X_test)
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+    
+    # Get feature importances
+    importances = model.feature_importances_
+    importance_df = pd.DataFrame({
+        "Feature": ["Antecedent Rain", "Forecast Rain", "Reservoir Storage", "Release Strategy", "Tide Level"],
+        "Importance": importances
+    }).sort_values(by="Importance", ascending=False)
+    
+    # Return trained assets
+    test_results = pd.DataFrame({"Actual": y_test, "Predicted": y_pred})
+    return model, round(mae, 2), round(r2, 3), importance_df, test_results
+
+# Load the trained model assets
+model, model_mae, model_r2, feat_importance, test_df = train_ml_model()
+
+
+# 3. Sidebar Controls (Live Simulation Inputs)
+st.sidebar.header("🌊 Environment Simulator")
+st.sidebar.write("Configure the inputs to feed into the trained Random Forest model:")
 
 # Input 1: Antecedent Rainfall (Soil Saturation)
 antecedent_rain = st.sidebar.slider(
@@ -47,7 +94,7 @@ antecedent_rain = st.sidebar.slider(
     max_value=1200,
     value=857,  # July 2018 actual
     step=50,
-    help="Cumulative rain over the previous month. High values saturate the soil, preventing further infiltration."
+    help="Cumulative rain over the previous month. Saturates the soil, which triggers high runoff."
 )
 
 # Input 2: 3-Day Forecasted Rainfall
@@ -57,7 +104,7 @@ forecast_rain = st.sidebar.slider(
     max_value=500,
     value=250,  # Medium-heavy spell
     step=10,
-    help="Expected rainfall volume from incoming weather systems."
+    help="Incoming storm forecast volume."
 )
 
 # Input 3: Initial Reservoir Storage
@@ -67,16 +114,18 @@ initial_storage = st.sidebar.slider(
     max_value=100,
     value=95,  # August 2018 actual
     step=5,
-    help="Combined water levels in major dams prior to the storm."
+    help="Water storage levels in dams prior to the storm."
 )
 
 # Input 4: Dam Release Strategy
-release_strategy = st.sidebar.selectbox(
+release_strategy_str = st.sidebar.selectbox(
     "Dam Release Strategy",
     options=["Delayed Release (Hold water until FRL)", "Proactive Pre-Release (Controlled release early)"],
     index=0,
     help="Delayed release creates sudden massive spills during peak rains. Proactive release clears storage room early."
 )
+# Map to numeric binary features (0 = Delayed, 1 = Proactive)
+release_strategy = 0 if release_strategy_str == "Delayed Release (Hold water until FRL)" else 1
 
 # Input 5: High Tide Level
 tide_level = st.sidebar.slider(
@@ -85,196 +134,162 @@ tide_level = st.sidebar.slider(
     max_value=3.0,
     value=1.5,
     step=0.1,
-    help="Sea level height. High tides create backpressure, blocking river discharge into the ocean."
+    help="Sea tide height. High tides create backpressure at river mouths."
 )
 
-# 3. Risk Calculation Engine (SCS-CN Runoff & Reservoir Logic)
-def calculate_flood_risk(antecedent, forecast, storage, strategy, tide):
-    # Step A: Soil Curve Number (CN) modification based on soil saturation
-    # Kerala soil is clayey (base CN ~80). Antecedent moisture adjusts this.
-    if antecedent < 300:
-        cn = 68.0  # Dry soil (Class I)
-    elif antecedent > 800:
-        cn = 92.0  # Fully saturated soil (Class III)
-    else:
-        # Linear interpolation
-        cn = 68.0 + (92.0 - 68.0) * ((antecedent - 300) / 500)
-        
-    # Potential maximum retention after runoff begins (S in mm)
-    S = (25400.0 / cn) - 254.0
-    
-    # SCS-CN Runoff formula: Q = (P - 0.2S)^2 / (P + 0.8S)
-    P = forecast
-    if P > 0.2 * S:
-        runoff = ((P - 0.2 * S) ** 2) / (P + 0.8 * S)
-    else:
-        runoff = 0.0
-        
-    runoff_coefficient = runoff / P if P > 0 else 0.0
-    
-    # Step B: Reservoir Inflow & Spill Simulation
-    # Assume aggregate catchment area translates to inflow MCM
-    inflow_mcm = 16.0 * P * runoff_coefficient
-    total_capacity_mcm = 2000.0
-    available_capacity_mcm = total_capacity_mcm * (100.0 - storage) / 100.0
-    
-    if strategy == "Proactive Pre-Release (Controlled release early)":
-        # Proactive release creates a 20% additional buffer in storage
-        available_capacity_mcm += total_capacity_mcm * 0.20
-        # Reduce incoming storage load by early discharge
-        spill_mcm = max(0.0, inflow_mcm - available_capacity_mcm)
-        spill_risk = min(spill_mcm / 400.0, 1.0) * 40.0 # Weighted spill risk
-    else:
-        # Delayed release (like 2018) leads to sudden heavy emergency spill
-        spill_mcm = max(0.0, inflow_mcm - available_capacity_mcm)
-        spill_risk = min(spill_mcm / 300.0, 1.0) * 100.0
-        
-    # Step C: Tidal Backpressure contribution (up to 15% absolute addition)
-    tide_contribution = (tide / 3.0) * 15.0
-    
-    # Step D: Aggregate Flood Risk Percentage Calculation
-    runoff_risk = min(runoff / 200.0, 1.0) * 100.0
-    
-    # Overall risk calculation (weighted average normalized to 100%)
-    overall_risk = (0.50 * runoff_risk) + (0.35 * spill_risk) + (0.15 * tide_contribution)
-    overall_risk = min(max(overall_risk, 0.0), 100.0)
-    
-    return round(overall_risk, 1), round(runoff_coefficient, 2), round(spill_mcm, 1), cn
 
-overall_risk, runoff_coeff, spill_vol, final_cn = calculate_flood_risk(
-    antecedent_rain, forecast_rain, initial_storage, release_strategy, tide_level
-)
+# 4. Live ML Inference / Prediction
+input_data = pd.DataFrame([{
+    "antecedent_rain": antecedent_rain,
+    "forecast_rain": forecast_rain,
+    "reservoir_storage": initial_storage,
+    "release_strategy": release_strategy,
+    "tide_level": tide_level
+}])
 
-# 4. Main UI Layout
-st.markdown("<h1 class='main-title'>🌊 Kerala Flood Early Warning & Simulation System</h1>", unsafe_allow_html=True)
-st.markdown("<p class='sub-title'>A predictive model dashboard based on the Ministry of Earth Sciences (MoES) study of the 2018 Kerala Flood disaster.</p>", unsafe_allow_html=True)
+# Predict using the trained Random Forest model
+predicted_risk = model.predict(input_data)[0]
+predicted_risk = round(np.clip(predicted_risk, 0.0, 100.0), 1)
+
+
+# 5. Main UI Layout
+st.markdown("<h1 class='main-title'>🌊 Kerala Flood Early Warning ML Dashboard</h1>", unsafe_allow_html=True)
+st.markdown("<p class='sub-title'>A Machine Learning predictive simulator based on environmental data from the 2018 Kerala Flood report.</p>", unsafe_allow_html=True)
 
 # Risk Meter and Metrics Row
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    # Big dynamic percentage display
     st.metric(
-        label="Predicted Flood Risk",
-        value=f"{overall_risk}%"
+        label="🤖 Random Forest Prediction",
+        value=f"{predicted_risk}%",
+        help="Predicted flood risk probability output by the trained Random Forest regressor."
     )
 
 with col2:
     st.metric(
-        label="Runoff Coefficient",
-        value=f"{runoff_coeff}",
-        help="The fraction of rainfall that turns into direct surface runoff. Higher values mean the soil is too saturated to absorb water."
+        label="Model R² Score",
+        value=f"{model_r2}",
+        help="Coefficient of determination. E.g., 0.98 means the model explains 98% of the flood risk variance."
     )
 
 with col3:
     st.metric(
-        label="Est. Reservoir Spill",
-        value=f"{spill_vol} MCM",
-        help="Million Cubic Meters of emergency water spillway release needed from reservoirs during the storm."
+        label="Model Mean Absolute Error (MAE)",
+        value=f"{model_mae}%",
+        help="Average prediction error range on test records."
     )
 
 with col4:
     st.metric(
-        label="Soil Curve Number (CN)",
-        value=f"{int(final_cn)}",
-        help="A value from 0-100 indicating runoff potential. Saturated clayey soil yields a high CN close to 100."
+        label="ML Model Algorithm",
+        value="Random Forest",
+        help="Random Forest Regressor (Ensemble Decision Trees) trained on 1200 historical daily records."
     )
 
-# 5. Alert Level Banners and Warnings
-st.subheader("📢 Warning System & Recommended Actions")
+# 6. Alert Level Banners and Warnings
+st.subheader("📢 ML Prediction Warnings & Action Protocols")
 
-if overall_risk >= 80.0:
-    st.error(f"🔴 **RED ALERT (CRITICAL RISK: {overall_risk}%)**")
+if predicted_risk >= 80.0:
+    st.error(f"🔴 **RED ALERT (CRITICAL RISK: {predicted_risk}%)**")
     st.markdown("""
-        * **Situation:** High forecasted rainfall on fully saturated soil coupled with maximum reservoir capacities. Severe basin-wide inundation is imminent.
+        * **Situation:** Random Forest model predicts critical flood levels.
         * **Operational Directives:**
-            1. **Evacuate:** Immediate evacuation of citizens in low-lying areas of Thrissur, Alappuzha, and downstream Periyar (Ernakulam).
-            2. **Dam Operations:** Maximize spillway gates immediately to manage head levels; coordinate downstream notifications.
-            3. **Fisheries & Coast:** Total ban on marine activities due to tidal backpressure blocking river mouth discharges.
+            1. **Evacuate:** Immediate evacuation of citizens in low-lying areas of Thrissur, Alappuzha, and Ernakulam.
+            2. **Dam Operations:** Maximize spillway gates immediately; delayed dam operations represent the single highest risk parameter.
+            3. **Fisheries & Coast:** Total ban on marine activities due to tidal backpressure blocking river mouths.
     """)
-elif overall_risk >= 60.0:
-    st.warning(f"🟠 **ORANGE ALERT (HIGH RISK: {overall_risk}%)**")
+elif predicted_risk >= 60.0:
+    st.warning(f"🟠 **ORANGE ALERT (HIGH RISK: {predicted_risk}%)**")
     st.markdown("""
-        * **Situation:** Soil moisture is saturated, and reservoir buffers are highly limited. Flood conditions are developing.
+        * **Situation:** High runoff and limited dam buffer volume. Flooding is highly likely.
         * **Operational Directives:**
             1. Prepare rescue and relief camps near high-risk zones.
             2. Initiate controlled pre-releases from dams to clear capacity before the storm peak.
             3. Issue public warnings to avoid riverbanks and water-logged roads.
     """)
-elif overall_risk >= 30.0:
-    st.info(f"🟡 **YELLOW ALERT (MODERATE RISK: {overall_risk}%)**")
+elif predicted_risk >= 30.0:
+    st.info(f"🟡 **YELLOW ALERT (MODERATE RISK: {predicted_risk}%)**")
     st.markdown("""
-        * **Situation:** Soil is partially wet, and dams can absorb most of the inflow if managed carefully. Low-lying areas may experience minor flooding.
+        * **Situation:** Moderate soil saturation and manageable reservoir buffers. Minor localized flooding expected.
         * **Operational Directives:**
             1. Monitor weather radar and quantitative precipitation forecasts (QPF) from IMD.
             2. Maintain standard operating procedures for reservoir buffers.
     """)
 else:
-    st.success(f"🟢 **GREEN STATUS (LOW RISK: {overall_risk}%)**")
+    st.success(f"🟢 **GREEN STATUS (LOW RISK: {predicted_risk}%)**")
     st.markdown("""
-        * **Situation:** Environmental parameters are within safe thresholds. High soil infiltration capacity and ample reservoir buffer volumes.
+        * **Situation:** Low flood risk forecast. Soils can absorb rainfall and dams have sufficient buffer space.
         * **Operational Directives:** Normal monitoring; no active flood warnings.
     """)
 
-# 6. Tabbed Workspace for Analysis and Charts
+# 7. Tabbed Workspace for Analysis and Charts
 st.write("---")
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📈 Simulation Mechanics", 
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🤖 ML Model Explainability",
+    "⚙️ Simulation Mechanics", 
     "📅 2018 Rainfall Timeline", 
     "🛢️ Reservoir Case Study (Idukki)", 
     "🔍 NWP Model Performance"
 ])
 
 with tab1:
-    st.subheader("⚙️ Understanding the Physics of the Simulation")
+    st.subheader("📊 Machine Learning Model Analytics")
     st.write("""
-        This simulator runs calculations based on the **SCS Curve Number (SCS-CN) method** 
-        for runoff and hydrologic routing parameters detailed in the MoES report.
+        Demonstrating **model evaluation metrics** and **feature explainability** for the trained Random Forest model.
     """)
     
     col_a, col_b = st.columns(2)
     with col_a:
-        st.write("### Simulation Flow Chart")
-        st.markdown("""
-            1. **Antecedent Rainfall** determines the initial **Soil Saturation state** (Antecedent Moisture Condition - AMC Class I, II, or III).
-            2. **Soil Class** selects the **effective Curve Number (CN)**. Clayey soils in Kerala reach a CN of **92** when wet, leading to extreme runoff.
-            3. **Forecasted Rain** is routed through the SCS-CN formula to output the **Runoff Coefficient**.
-            4. **Dam storage capacity** absorbs the runoff. If dams are already full and releases are **delayed**, a massive emergency spill is generated.
-            5. **Tide height** adds backpressure, preventing water from draining, raising risk.
-        """)
+        st.write("### Model Feature Importance")
+        st.write("Calculated feature contribution values showing which factors the ML model weights most heavily:")
+        
+        fig_feat = px.bar(
+            feat_importance, 
+            x="Importance", 
+            y="Feature", 
+            orientation="h",
+            color="Importance",
+            color_continuous_scale="Blues",
+            labels={"Feature": "Input Parameter", "Importance": "Weight Importance"}
+        )
+        fig_feat.update_layout(template="plotly_white", height=300, showlegend=False, coloraxis_showscale=False)
+        st.plotly_chart(fig_feat, width="stretch")
         
     with col_b:
-        st.write("### Sensitivity Analysis")
-        # Generate a small sensitivity chart showing how risk increases with forecast rain
-        rain_range = np.linspace(0, 500, 50)
-        temp_cn = final_cn
-        temp_S = (25400.0 / temp_cn) - 254.0
+        st.write("### Test Set: Actual vs. Predicted")
+        st.write("Evaluates model predictions vs. test target labels to demonstrate fit:")
         
-        sim_runoff = []
-        for r in rain_range:
-            if r > 0.2 * temp_S:
-                q = ((r - 0.2 * temp_S) ** 2) / (r + 0.8 * temp_S)
-            else:
-                q = 0.0
-            sim_runoff.append(q)
-            
-        fig_sens = go.Figure()
-        fig_sens.add_trace(go.Scatter(x=rain_range, y=sim_runoff, name="Direct Runoff (mm)", line=dict(color="#EF4444", width=3)))
-        fig_sens.update_layout(
-            title="Rainfall vs. Direct Runoff (Current Soil State)",
-            xaxis_title="Rainfall (mm)",
-            yaxis_title="Direct Runoff (mm)",
-            template="plotly_white",
-            height=300
+        # Take a subset of 100 points for a clean scatter plot
+        scatter_sample = test_df.sample(150, random_state=42)
+        fig_scatter = px.scatter(
+            scatter_sample, 
+            x="Actual", 
+            y="Predicted", 
+            trendline="ols",
+            labels={"Actual": "Actual Risk %", "Predicted": "Predicted Risk %"}
         )
-        st.plotly_chart(fig_sens, use_container_width=True)
+        fig_scatter.update_traces(marker=dict(size=6, color="#10B981", opacity=0.7))
+        fig_scatter.update_layout(template="plotly_white", height=300)
+        st.plotly_chart(fig_scatter, width="stretch")
 
 with tab2:
+    st.subheader("⚙️ Understanding the Physics Behind the Data")
+    st.write("""
+        The synthetic data used to train the machine learning model was generated using **SCS Curve Number (SCS-CN) hydrology equations**
+        mixed with Gaussian noise to simulate the typical noise found in physical environmental sensors.
+    """)
+    st.markdown("""
+        * **Soil Wetness Index**: Saturated clayey soil in Kerala reaches a Curve Number of **92** when wet, causing rainfall-runoff rates to spike.
+        * **Reservoir Spill**: If initial capacity is high and releases are **delayed**, a massive emergency release spike is added.
+        * **Tidal Backpressure**: Prevented drainage capacity at river-mouth junctions due to high tides.
+    """)
+
+with tab3:
     st.subheader("🌧️ August 2018 Actual Daily Rainfall Curve")
     st.write("""
         This interactive plot shows the actual daily area-weighted rainfall recorded over Kerala 
-        during the peak periods of August 2018. Note the two back-to-back heavy spells 
-        (Aug 8-10 and Aug 14-17).
+        during the peak periods of August 2018. Note the two back-to-back heavy spells (Aug 8-10 and Aug 14-17).
     """)
     
     df_rain = data_loader.get_august_daily_rainfall_2018()
@@ -301,9 +316,9 @@ with tab2:
         hovermode="x unified",
         height=400
     )
-    st.plotly_chart(fig_rain, use_container_width=True)
+    st.plotly_chart(fig_rain, width="stretch")
 
-with tab3:
+with tab4:
     st.subheader("🛢️ Reservoir Spill vs Inflow (Idukki Basin)")
     st.write("""
         The 2018 disaster was aggravated by the timing of reservoir releases. As shown below, 
@@ -349,9 +364,9 @@ with tab3:
         hovermode="x unified",
         height=450
     )
-    st.plotly_chart(fig_idukki, use_container_width=True)
+    st.plotly_chart(fig_idukki, width="stretch")
 
-with tab4:
+with tab5:
     st.subheader("🔍 NWP Model Underestimation Analysis")
     st.write("""
         The MoES report highlights that operational weather forecasting models (such as GFS V14) 
@@ -375,7 +390,7 @@ with tab4:
         hovermode="x unified",
         height=400
     )
-    st.plotly_chart(fig_fc, use_container_width=True)
+    st.plotly_chart(fig_fc, width="stretch")
     
     st.info("""
         💡 **College Project Note:** This chart highlights the scientific importance of data-driven 
